@@ -1,11 +1,26 @@
-import { DevtoolsApi } from '@vue-devtools/app-backend-api'
-import { App, ComponentState, CustomInspectorNode, CustomInspectorState, setupDevtoolsPlugin } from '@vue/devtools-api'
+import type { DevtoolsApi } from '@vue-devtools/app-backend-api'
+import type { App, ComponentState, CustomInspectorNode, CustomInspectorState } from '@vue/devtools-api'
+import { setupDevtoolsPlugin } from '@vue/devtools-api'
 import { isEmptyObject, target } from '@vue-devtools/shared-utils'
 import copy from 'clone-deep'
 
 let actionId = 0
 
-export function setupPlugin (api: DevtoolsApi, app: App, Vue) {
+const VUEX_ROOT_PATH = '__vdt_root'
+const VUEX_MODULE_PATH_SEPARATOR = '[vdt]'
+const VUEX_MODULE_PATH_SEPARATOR_REG = /\[vdt\]/g
+
+/**
+ * Extracted from tailwind palette
+ */
+const BLUE_600 = 0x2563EB
+const LIME_500 = 0x84CC16
+const CYAN_400 = 0x22D3EE
+const ORANGE_400 = 0xFB923C
+const WHITE = 0xFFFFFF
+const DARK = 0x666666
+
+export function setupPlugin(api: DevtoolsApi, app: App, Vue) {
   const ROUTER_INSPECTOR_ID = 'vue2-router-inspector'
   const ROUTER_CHANGES_LAYER_ID = 'vue2-router-changes'
 
@@ -18,8 +33,16 @@ export function setupPlugin (api: DevtoolsApi, app: App, Vue) {
     id: 'org.vuejs.vue2-internal',
     label: 'Vue 2',
     homepage: 'https://vuejs.org/',
-    logo: 'https://vuejs.org/images/icons/favicon-96x96.png',
-  }, api => {
+    logo: 'https://v2.vuejs.org/images/icons/favicon-96x96.png',
+    settings: {
+      legacyActions: {
+        label: 'Legacy Actions',
+        description: 'Enable this for Vuex < 3.1.0',
+        type: 'boolean',
+        defaultValue: false,
+      },
+    },
+  }, (api) => {
     const hook = target.__VUE_DEVTOOLS_GLOBAL_HOOK__
 
     // Vue Router
@@ -35,13 +58,18 @@ export function setupPlugin (api: DevtoolsApi, app: App, Vue) {
         treeFilterPlaceholder: 'Search routes',
       })
 
-      api.on.getInspectorTree(payload => {
+      api.on.getInspectorTree((payload) => {
         if (payload.inspectorId === ROUTER_INSPECTOR_ID) {
-          payload.rootNodes = router.options.routes.map(route => formatRouteNode(router, route, '', payload.filter)).filter(Boolean)
+          if (router.options.routes) {
+            payload.rootNodes = router.options.routes.map(route => formatRouteNode(router, route, '', payload.filter)).filter(Boolean)
+          }
+          else {
+            console.warn(`[Vue Devtools] No routes found in router`, router.options)
+          }
         }
       })
 
-      api.on.getInspectorState(payload => {
+      api.on.getInspectorState((payload) => {
         if (payload.inspectorId === ROUTER_INSPECTOR_ID) {
           const route = router.matcher.getRoutes().find(r => getPathId(r) === payload.nodeId)
           if (route) {
@@ -57,14 +85,14 @@ export function setupPlugin (api: DevtoolsApi, app: App, Vue) {
       api.addTimelineLayer({
         id: ROUTER_CHANGES_LAYER_ID,
         label: 'Router Navigations',
-        color: 0x40a8c4,
+        color: 0x40A8C4,
       })
 
       router.afterEach((to, from) => {
         api.addTimelineEvent({
           layerId: ROUTER_CHANGES_LAYER_ID,
           event: {
-            time: Date.now(),
+            time: api.now(),
             title: to.path,
             data: {
               from,
@@ -93,9 +121,10 @@ export function setupPlugin (api: DevtoolsApi, app: App, Vue) {
             const nodes = []
             flattenStoreForInspectorTree(nodes, store._modules.root, payload.filter, '')
             payload.rootNodes = nodes
-          } else {
+          }
+          else {
             payload.rootNodes = [
-              formatStoreForInspectorTree(store._modules.root, ''),
+              formatStoreForInspectorTree(store._modules.root, 'Root', ''),
             ]
           }
         }
@@ -104,15 +133,33 @@ export function setupPlugin (api: DevtoolsApi, app: App, Vue) {
       api.on.getInspectorState((payload) => {
         if (payload.inspectorId === VUEX_INSPECTOR_ID) {
           const modulePath = payload.nodeId
-          const module = getStoreModule(store._modules, modulePath)
+          const { module, getterPath } = getStoreModule(store._modules, modulePath)
+          if (!module) {
+            return
+          }
           // Access the getters prop to init getters cache (which is lazy)
           // eslint-disable-next-line no-unused-expressions
           module.context.getters
           payload.state = formatStoreForInspectorState(
             module,
             store._makeLocalGettersCache,
-            modulePath,
+            getterPath,
           )
+        }
+      })
+
+      api.on.editInspectorState((payload) => {
+        if (payload.inspectorId === VUEX_INSPECTOR_ID) {
+          let path = payload.path
+          if (payload.nodeId !== VUEX_ROOT_PATH) {
+            path = [
+              ...payload.nodeId.split(VUEX_MODULE_PATH_SEPARATOR).slice(0, -1),
+              ...path,
+            ]
+          }
+          store._committing = true
+          payload.set(store._vm.$data.$$state, path)
+          store._committing = false
         }
       })
 
@@ -142,65 +189,85 @@ export function setupPlugin (api: DevtoolsApi, app: App, Vue) {
         api.addTimelineEvent({
           layerId: VUEX_MUTATIONS_ID,
           event: {
-            time: Date.now(),
+            time: api.now(),
             title: mutation.type,
             data,
           },
         })
       })
 
-      store.subscribeAction({
-        before: (action, state) => {
-          const data: any = {}
-          if (action.payload) {
-            data.payload = action.payload
-          }
-          action._id = actionId++
-          action._time = Date.now()
-          data.state = state
+      function legacySingleActionSub(action, state) {
+        const data: any = {}
+        if (action.payload) {
+          data.payload = action.payload
+        }
 
-          api.addTimelineEvent({
-            layerId: VUEX_ACTIONS_ID,
-            event: {
-              time: action._time,
-              title: action.type,
-              groupId: action._id,
-              subtitle: 'start',
-              data,
-            },
-          })
-        },
-        after: (action, state) => {
-          const data: any = {}
-          const duration = Date.now() - action._time
-          data.duration = {
-            _custom: {
-              type: 'duration',
-              display: `${duration}ms`,
-              tooltip: 'Action duration',
-              value: duration,
-            },
-          }
-          if (action.payload) {
-            data.payload = action.payload
-          }
-          data.state = state
+        data.state = state
 
-          api.addTimelineEvent({
-            layerId: VUEX_ACTIONS_ID,
-            event: {
-              time: Date.now(),
-              title: action.type,
-              groupId: action._id,
-              subtitle: 'end',
-              data,
+        api.addTimelineEvent({
+          layerId: VUEX_ACTIONS_ID,
+          event: {
+            time: api.now(),
+            title: action.type,
+            data,
+          },
+        })
+      }
+
+      store.subscribeAction?.(api.getSettings().legacyActions
+        ? legacySingleActionSub
+        : {
+            before: (action, state) => {
+              const data: any = {}
+              if (action.payload) {
+                data.payload = action.payload
+              }
+              action._id = actionId++
+              action._time = api.now()
+              data.state = state
+
+              api.addTimelineEvent({
+                layerId: VUEX_ACTIONS_ID,
+                event: {
+                  time: action._time,
+                  title: action.type,
+                  groupId: action._id,
+                  subtitle: 'start',
+                  data,
+                },
+              })
             },
-          })
-        },
-      }, { prepend: true })
+            after: (action, state) => {
+              const data: any = {}
+              const duration = api.now() - action._time
+              data.duration = {
+                _custom: {
+                  type: 'duration',
+                  display: `${duration}ms`,
+                  tooltip: 'Action duration',
+                  value: duration,
+                },
+              }
+              if (action.payload) {
+                data.payload = action.payload
+              }
+              data.state = state
+
+              api.addTimelineEvent({
+                layerId: VUEX_ACTIONS_ID,
+                event: {
+                  time: api.now(),
+                  title: action.type,
+                  groupId: action._id,
+                  subtitle: 'end',
+                  data,
+                },
+              })
+            },
+          }, { prepend: true })
 
       // Inspect getters on mutations
-      api.on.inspectTimelineEvent(payload => {
+      api.on.inspectTimelineEvent((payload) => {
         if (payload.layerId === VUEX_MUTATIONS_ID) {
           const getterKeys = Object.keys(store.getters)
           if (getterKeys.length) {
@@ -225,25 +292,17 @@ export function setupPlugin (api: DevtoolsApi, app: App, Vue) {
   })
 }
 
-/**
- * Extracted from tailwind palette
- */
-const BLUE_600 = 0x2563eb
-const LIME_500 = 0x84cc16
-const CYAN_400 = 0x22d3ee
-const ORANGE_400 = 0xfb923c
-const WHITE = 0xffffff
-const DARK = 0x666666
-
-function formatRouteNode (router, route, parentPath: string, filter: string): CustomInspectorNode {
+function formatRouteNode(router, route, parentPath: string, filter: string): CustomInspectorNode {
   const node: CustomInspectorNode = {
-    id: parentPath + route.path,
+    id: route.path.startsWith('/') ? route.path : `${parentPath}/${route.path}`,
     label: route.path,
     children: route.children?.map(child => formatRouteNode(router, child, route.path, filter)).filter(Boolean),
     tags: [],
   }
 
-  if (filter && !node.id.includes(filter) && !node.children?.length) return null
+  if (filter && !node.id.includes(filter) && !node.children?.length) {
+    return null
+  }
 
   if (route.name != null) {
     node.tags.push({
@@ -261,8 +320,7 @@ function formatRouteNode (router, route, parentPath: string, filter: string): Cu
     })
   }
 
-  const currentPath = router.currentRoute.matched.reduce((p, m) => p + m.path, '')
-  if (node.id === currentPath) {
+  if (node.id === router.currentRoute.path) {
     node.tags.push({
       label: 'active',
       textColor: WHITE,
@@ -273,8 +331,8 @@ function formatRouteNode (router, route, parentPath: string, filter: string): Cu
   if (route.redirect) {
     node.tags.push({
       label:
-        'redirect: ' +
-        (typeof route.redirect === 'string' ? route.redirect : 'Object'),
+        `redirect: ${
+        typeof route.redirect === 'string' ? route.redirect : 'Object'}`,
       textColor: WHITE,
       backgroundColor: DARK,
     })
@@ -283,7 +341,7 @@ function formatRouteNode (router, route, parentPath: string, filter: string): Cu
   return node
 }
 
-function formatRouteData (route) {
+function formatRouteData(route) {
   const data: Omit<ComponentState, 'type'>[] = []
 
   data.push({ key: 'path', value: route.path })
@@ -323,7 +381,7 @@ function formatRouteData (route) {
   return data
 }
 
-function getPathId (routeMatcher) {
+function getPathId(routeMatcher) {
   let path = routeMatcher.path
   if (routeMatcher.parent) {
     path = getPathId(routeMatcher.parent) + path
@@ -337,66 +395,87 @@ const TAG_NAMESPACED = {
   backgroundColor: DARK,
 }
 
-function formatStoreForInspectorTree (module, path): CustomInspectorNode {
+function formatStoreForInspectorTree(module, moduleName: string, path: string): CustomInspectorNode {
   return {
-    id: path || 'root',
+    id: path || VUEX_ROOT_PATH,
     // all modules end with a `/`, we want the last segment only
     // cart/ -> cart
     // nested/cart/ -> cart
-    label: extractNameFromPath(path),
+    label: moduleName,
     tags: module.namespaced ? [TAG_NAMESPACED] : [],
-    children: Object.keys(module._children).map((moduleName) =>
+    children: Object.keys(module._children ?? {}).map(key =>
       formatStoreForInspectorTree(
-        module._children[moduleName],
-        path + moduleName + '/',
+        module._children[key],
+        key,
+        `${path}${key}${VUEX_MODULE_PATH_SEPARATOR}`,
       ),
     ),
   }
 }
 
-function flattenStoreForInspectorTree (result: CustomInspectorNode[], module, filter: string, path: string) {
+function flattenStoreForInspectorTree(result: CustomInspectorNode[], module, filter: string, path: string) {
   if (path.includes(filter)) {
     result.push({
-      id: path || 'root',
-      label: path.endsWith('/') ? path.slice(0, path.length - 1) : path || 'Root',
+      id: path || VUEX_ROOT_PATH,
+      label: path.endsWith(VUEX_MODULE_PATH_SEPARATOR) ? path.slice(0, path.length - 1) : path || 'Root',
       tags: module.namespaced ? [TAG_NAMESPACED] : [],
     })
   }
-  Object.keys(module._children).forEach(moduleName => {
-    flattenStoreForInspectorTree(result, module._children[moduleName], filter, path + moduleName + '/')
+  Object.keys(module._children).forEach((moduleName) => {
+    flattenStoreForInspectorTree(result, module._children[moduleName], filter, path + moduleName + VUEX_MODULE_PATH_SEPARATOR)
   })
 }
 
-function extractNameFromPath (path: string) {
-  return path && path !== 'root' ? path.split('/').slice(-2, -1)[0] : 'Root'
+function extractNameFromPath(path: string) {
+  return path && path !== VUEX_ROOT_PATH ? path.split(VUEX_MODULE_PATH_SEPARATOR).slice(-2, -1)[0] : 'Root'
 }
 
-function formatStoreForInspectorState (module, getters, path): CustomInspectorState {
-  getters = !module.namespaced || path === 'root' ? module.context.getters : getters[path]
-  const gettersKeys = Object.keys(getters)
+function formatStoreForInspectorState(module, getters, path): CustomInspectorState {
   const storeState: CustomInspectorState = {
-    state: Object.keys(module.state).map((key) => ({
+    state: Object.keys(module.context.state ?? {}).map(key => ({
       key,
       editable: true,
-      value: module.state[key],
+      value: module.context.state[key],
     })),
   }
 
-  if (gettersKeys.length) {
-    const tree = transformPathsToObjectTree(getters)
-    storeState.getters = Object.keys(tree).map((key) => ({
-      key: key.endsWith('/') ? extractNameFromPath(key) : key,
-      editable: false,
-      value: canThrow(() => tree[key]),
-    }))
+  if (getters) {
+    const pathWithSlashes = path.replace(VUEX_MODULE_PATH_SEPARATOR_REG, '/')
+    getters = !module.namespaced || path === VUEX_ROOT_PATH ? module.context.getters : getters[pathWithSlashes]
+    let gettersKeys = Object.keys(getters)
+    const shouldPickGetters = !module.namespaced && path !== VUEX_ROOT_PATH
+    if (shouldPickGetters) {
+      // Only pick the getters defined in the non-namespaced module
+      const definedGettersKeys = Object.keys(module._rawModule.getters ?? {})
+      gettersKeys = gettersKeys.filter(key => definedGettersKeys.includes(key))
+    }
+    if (gettersKeys.length) {
+      let moduleGetters: Record<string, any>
+      if (shouldPickGetters) {
+        // Only pick the getters defined in the non-namespaced module
+        moduleGetters = {}
+        for (const key of gettersKeys) {
+          moduleGetters[key] = canThrow(() => getters[key])
+        }
+      }
+      else {
+        moduleGetters = getters
+      }
+      const tree = transformPathsToObjectTree(moduleGetters)
+      storeState.getters = Object.keys(tree).map(key => ({
+        key: key.endsWith('/') ? extractNameFromPath(key) : key,
+        editable: false,
+        value: canThrow(() => tree[key]),
+      }))
+    }
   }
 
   return storeState
 }
 
-function transformPathsToObjectTree (getters) {
+function transformPathsToObjectTree(getters) {
   const result = {}
-  Object.keys(getters).forEach(key => {
+  Object.keys(getters).forEach((key) => {
     const path = key.split('/')
     if (path.length > 1) {
       let target = result
@@ -415,31 +494,41 @@ function transformPathsToObjectTree (getters) {
         target = target[p]._custom.value
       }
       target[leafKey] = canThrow(() => getters[key])
-    } else {
+    }
+    else {
       result[key] = canThrow(() => getters[key])
     }
   })
   return result
 }
 
-function getStoreModule (moduleMap, path) {
-  const names = path.split('/').filter((n) => n)
+function getStoreModule(moduleMap, path) {
+  const names = path.split(VUEX_MODULE_PATH_SEPARATOR).filter(n => n)
   return names.reduce(
-    (module, moduleName, i) => {
-      const child = module[moduleName]
+    ({ module, getterPath }, moduleName, i) => {
+      const child = module[moduleName === VUEX_ROOT_PATH ? 'root' : moduleName]
       if (!child) {
-        throw new Error(`Missing module "${moduleName}" for path "${path}".`)
+        return null
       }
-      return i === names.length - 1 ? child : child._children
+      return {
+        module: i === names.length - 1 ? child : child._children,
+        getterPath: child._rawModule.namespaced
+          ? getterPath
+          : getterPath.replace(`${moduleName}${VUEX_MODULE_PATH_SEPARATOR}`, ''),
+      }
     },
-    path === 'root' ? moduleMap : moduleMap.root._children,
+    {
+      module: path === VUEX_ROOT_PATH ? moduleMap : moduleMap.root._children,
+      getterPath: path,
+    },
   )
 }
 
-function canThrow (cb: () => any) {
+function canThrow(cb: () => any) {
   try {
     return cb()
-  } catch (e) {
+  }
+  catch (e) {
     return e
   }
 }

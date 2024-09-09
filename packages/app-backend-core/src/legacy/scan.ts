@@ -1,20 +1,20 @@
 import { isBrowser, target } from '@vue-devtools/shared-utils'
+import { getPageConfig } from '../page-config'
 
 const rootInstances = []
 
 /**
  * Scan the page for root level Vue instances.
  */
-export function scan () {
+export function scan() {
   rootInstances.length = 0
 
   let inFragment = false
   let currentFragment = null
 
-  // eslint-disable-next-line no-inner-declarations
-  function processInstance (instance) {
+  function processInstance(instance) {
     if (instance) {
-      if (rootInstances.indexOf(instance.$root) === -1) {
+      if (!rootInstances.includes(instance.$root)) {
         instance = instance.$root
       }
       if (instance._isFragment) {
@@ -36,8 +36,8 @@ export function scan () {
   }
 
   if (isBrowser) {
-    const walkDocument = document => {
-      walk(document, function (node) {
+    const walkDocument = (document) => {
+      walk(document, (node) => {
         if (inFragment) {
           if (node === currentFragment._fragmentEnd) {
             inFragment = false
@@ -56,11 +56,25 @@ export function scan () {
     for (const iframe of iframes) {
       try {
         walkDocument(iframe.contentDocument)
-      } catch (e) {
+      }
+      catch (e) {
         // Ignore
       }
     }
-  } else {
+
+    // Scan for Vue instances in the customTarget elements
+    const { customVue2ScanSelector } = getPageConfig()
+    const customTargets = customVue2ScanSelector ? document.querySelectorAll(customVue2ScanSelector) : []
+    for (const customTarget of customTargets) {
+      try {
+        walkDocument(customTarget)
+      }
+      catch (e) {
+        // Ignore
+      }
+    }
+  }
+  else {
     if (Array.isArray(target.__VUE_ROOT_INSTANCES__)) {
       target.__VUE_ROOT_INSTANCES__.map(processInstance)
     }
@@ -76,7 +90,7 @@ export function scan () {
  * @param {Function} fn
  */
 
-function walk (node, fn) {
+function walk(node, fn) {
   if (node.childNodes) {
     for (let i = 0, l = node.childNodes.length; i < l; i++) {
       const child = node.childNodes[i]

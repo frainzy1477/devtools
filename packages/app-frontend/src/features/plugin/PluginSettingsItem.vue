@@ -1,7 +1,8 @@
 <script lang="ts">
-import { defineComponent, PropType, computed } from '@vue/composition-api'
-import { PluginSettingsItem } from '@vue/devtools-api'
-import { Plugin } from '.'
+import type { PropType } from 'vue'
+import { computed, defineComponent } from 'vue'
+import type { PluginSettingsItem } from '@vue/devtools-api'
+import type { Plugin } from '.'
 
 export default defineComponent({
   props: {
@@ -20,21 +21,25 @@ export default defineComponent({
       required: true,
     },
 
-    value: {},
+    value: {
+      required: true,
+    },
   },
-
-  setup (props, { emit }) {
+  emits: ['update:value'],
+  setup(props, { emit }) {
     const model = computed({
-      get () {
+      get() {
         return props.value
       },
-      set (value) {
+      set(value) {
         emit('update:value', value)
       },
     })
 
-    function onLabelClick () {
-      // @TODO
+    function onLabelClick() {
+      if (props.schema.type === 'boolean') {
+        model.value = !model.value
+      }
     }
 
     return {
@@ -46,19 +51,30 @@ export default defineComponent({
 </script>
 
 <template>
-  <div class="flex items-start px-6 py-2 hover:bg-green-50 dark:hover:bg-green-900">
-    <div
-      class="flex-1 select-none text-sm py-1.5"
-      @click="onLabelClick()"
-    >
-      {{ schema.label }}
+  <div
+    class="flex items-start px-6 py-2 hover:bg-green-50 dark:hover:bg-green-900"
+    @click="onLabelClick()"
+  >
+    <div class="flex-1 select-none text-sm py-1.5">
+      <div>{{ schema.label }}</div>
+      <div
+        v-if="schema.description"
+        class="opacity-75 text-xs"
+      >
+        {{ schema.description }}
+      </div>
     </div>
     <div class="w-1/2">
-      <VueSwitch
+      <div
         v-if="schema.type === 'boolean'"
-        v-model="model"
-        class="my-2 w-full extend-left"
-      />
+        class="my-2 w-full h-[max-content]"
+        @click.stop
+      >
+        <VueSwitch
+          v-model="model"
+          class="w-full extend-left"
+        />
+      </div>
 
       <template v-else-if="schema.type === 'choice'">
         <VueGroup

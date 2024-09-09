@@ -1,17 +1,19 @@
-import {
+import type {
   AppRecord,
-  SimpleAppRecord,
   AppRecordOptions,
   BackendContext,
   DevtoolsBackend,
+  SimpleAppRecord,
 } from '@vue-devtools/app-backend-api'
-import { BridgeEvents, SharedData } from '@vue-devtools/shared-utils'
-import { App } from '@vue/devtools-api'
+import { BridgeEvents, SharedData, isBrowser } from '@vue-devtools/shared-utils'
+import type { App } from '@vue/devtools-api'
 import slug from 'speakingurl'
 import { JobQueue } from './util/queue'
 import { scan } from './legacy/scan'
 import { addBuiltinLayers, removeLayersForApp } from './timeline'
-import { getBackend, availableBackends } from './backend'
+import { availableBackends, getBackend } from './backend'
+import { hook } from './global-hook.js'
+import { sendComponentTreeData, sendSelectedComponentData } from './component.js'
 
 const jobs = new JobQueue()
 
@@ -20,18 +22,22 @@ let recordId = 0
 type AppRecordResolver = (record: AppRecord) => void | Promise<void>
 const appRecordPromises = new Map<App, AppRecordResolver[]>()
 
-export async function registerApp (options: AppRecordOptions, ctx: BackendContext) {
-  return jobs.queue(() => registerAppJob(options, ctx))
+export async function registerApp(options: AppRecordOptions, ctx: BackendContext) {
+  return jobs.queue('regiserApp', () => registerAppJob(options, ctx))
 }
 
-async function registerAppJob (options: AppRecordOptions, ctx: BackendContext) {
+async function registerAppJob(options: AppRecordOptions, ctx: BackendContext) {
   // Dedupe
-  if (ctx.appRecords.find(a => a.options === options)) {
+  if (ctx.appRecords.find(a => a.options.app === options.app)) {
     return
   }
 
+  if (!options.version) {
+    throw new Error('[Vue Devtools] Vue version not found')
+  }
+
   // Find correct backend
-  const baseFrameworkVersion = parseInt(options.version.substr(0, options.version.indexOf('.')))
+  const baseFrameworkVersion = Number.parseInt(options.version.substring(0, options.version.indexOf('.')))
   for (let i = 0; i < availableBackends.length; i++) {
     const backendOptions = availableBackends[i]
     if (backendOptions.frameworkVersion === baseFrameworkVersion) {
@@ -45,14 +51,21 @@ async function registerAppJob (options: AppRecordOptions, ctx: BackendContext) {
   }
 }
 
-async function createAppRecord (options: AppRecordOptions, backend: DevtoolsBackend, ctx: BackendContext) {
+async function createAppRecord(options: AppRecordOptions, backend: DevtoolsBackend, ctx: BackendContext) {
   const rootInstance = await backend.api.getAppRootInstance(options.app)
   if (rootInstance) {
+    if ((await backend.api.getComponentDevtoolsOptions(rootInstance)).hide) {
+      options.app._vueDevtools_hidden_ = true
+      return
+    }
+
     recordId++
     const name = await backend.api.getAppRecordName(options.app, recordId.toString())
     const id = getAppRecordId(options.app, slug(name))
 
     const [el]: HTMLElement[] = await backend.api.getComponentRootElements(rootInstance)
+
+    const instanceMapRaw = new Map<string, any>()
 
     const record: AppRecord = {
       id,
@@ -60,12 +73,33 @@ async function createAppRecord (options: AppRecordOptions, backend: DevtoolsBack
       options,
       backend,
       lastInspectedComponentId: null,
-      instanceMap: new Map(),
+      instanceMap: new Proxy(instanceMapRaw, {
+        get(target, key: string) {
+          if (key === 'set') {
+            return (instanceId: string, instance: any) => {
+              target.set(instanceId, instance)
+              // The component was requested by the frontend before it was registered
+              if (record.missingInstanceQueue.has(instanceId)) {
+                record.missingInstanceQueue.delete(instanceId)
+                if (ctx.currentAppRecord === record) {
+                  sendComponentTreeData(record, instanceId, record.componentFilter, null, false, ctx)
+                  if (record.lastInspectedComponentId === instanceId) {
+                    sendSelectedComponentData(record, instanceId, ctx)
+                  }
+                }
+              }
+            }
+          }
+          return target[key].bind(target)
+        },
+      }),
       rootInstance,
       perfGroupIds: new Map(),
-      iframe: document !== el.ownerDocument ? el.ownerDocument.location.pathname : null,
+      iframe: isBrowser && document !== el?.ownerDocument ? el?.ownerDocument?.location?.pathname : null,
       meta: options.meta ?? {},
+      missingInstanceQueue: new Set(),
     }
+
     options.app.__VUE_DEVTOOLS_APP_RECORD__ = record
     const rootId = `${record.id}:root`
     record.instanceMap.set(rootId, record.rootInstance)
@@ -82,12 +116,13 @@ async function createAppRecord (options: AppRecordOptions, backend: DevtoolsBack
 
     await backend.api.registerApplication(options.app)
 
-    const isAppHidden = !!(await record.backend.api.getComponentDevtoolsOptions(record.rootInstance)).hide
+    ctx.bridge.send(BridgeEvents.TO_FRONT_APP_ADD, {
+      appRecord: mapAppRecord(record),
+    })
 
-    if (!isAppHidden) {
-      ctx.bridge.send(BridgeEvents.TO_FRONT_APP_ADD, {
-        appRecord: mapAppRecord(record),
-      })
+    // Auto select first app
+    if (ctx.currentAppRecord == null) {
+      await selectApp(record, ctx)
     }
 
     if (appRecordPromises.has(options.app)) {
@@ -95,17 +130,13 @@ async function createAppRecord (options: AppRecordOptions, backend: DevtoolsBack
         await r(record)
       }
     }
-
-    // Auto select first app
-    if (ctx.currentAppRecord == null && !isAppHidden) {
-      await selectApp(record, ctx)
-    }
-  } else {
+  }
+  else if (SharedData.debugInfo) {
     console.warn('[Vue devtools] No root instance found for app, it might have been unmounted', options.app)
   }
 }
 
-export async function selectApp (record: AppRecord, ctx: BackendContext) {
+export async function selectApp(record: AppRecord, ctx: BackendContext) {
   ctx.currentAppRecord = record
   ctx.currentInspectedComponentId = record.lastInspectedComponentId
   ctx.bridge.send(BridgeEvents.TO_FRONT_APP_SELECTED, {
@@ -114,7 +145,7 @@ export async function selectApp (record: AppRecord, ctx: BackendContext) {
   })
 }
 
-export function mapAppRecord (record: AppRecord): SimpleAppRecord {
+export function mapAppRecord(record: AppRecord): SimpleAppRecord {
   return {
     id: record.id,
     name: record.name,
@@ -125,7 +156,7 @@ export function mapAppRecord (record: AppRecord): SimpleAppRecord {
 
 const appIds = new Set()
 
-export function getAppRecordId (app, defaultId?: string): string {
+export function getAppRecordId(app, defaultId?: string): string {
   if (app.__VUE_DEVTOOLS_APP_RECORD_ID__ != null) {
     return app.__VUE_DEVTOOLS_APP_RECORD_ID__
   }
@@ -133,7 +164,7 @@ export function getAppRecordId (app, defaultId?: string): string {
 
   if (defaultId && appIds.has(id)) {
     let count = 1
-    while (appIds.has(`${defaultId}:${count}`)) {
+    while (appIds.has(`${defaultId}_${count}`)) {
       count++
     }
     id = `${defaultId}_${count}`
@@ -145,42 +176,53 @@ export function getAppRecordId (app, defaultId?: string): string {
   return id
 }
 
-export async function getAppRecord (app: any, ctx: BackendContext): Promise<AppRecord> {
-  const record = ctx.appRecords.find(ar => ar.options.app === app)
+export async function getAppRecord(app: any, ctx: BackendContext): Promise<AppRecord> {
+  const record = app.__VUE_DEVTOOLS_APP_RECORD__ ?? ctx.appRecords.find(ar => ar.options.app === app)
   if (record) {
     return record
   }
+  if (app._vueDevtools_hidden_) {
+    return null
+  }
   return new Promise((resolve, reject) => {
-    let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      reject(new Error(`Timed out getting app record for app ${app}`))
-    }, 2000)
     let resolvers = appRecordPromises.get(app)
+    let timedOut = false
     if (!resolvers) {
       resolvers = []
       appRecordPromises.set(app, resolvers)
     }
-    resolvers.push((record) => {
+    let timer: any
+    const fn = (record) => {
       if (!timedOut) {
         clearTimeout(timer)
         resolve(record)
       }
-    })
+    }
+    resolvers.push(fn)
+    timer = setTimeout(() => {
+      timedOut = true
+      const index = resolvers.indexOf(fn)
+      if (index !== -1) {
+        resolvers.splice(index, 1)
+      }
+      if (SharedData.debugInfo) {
+        // eslint-disable-next-line no-console
+        console.log('Timed out waiting for app record', app)
+      }
+      reject(new Error(`Timed out getting app record for app`))
+    }, 60000)
   })
 }
 
-export function waitForAppsRegistration () {
-  return jobs.queue(async () => { /* NOOP */ })
+export function waitForAppsRegistration() {
+  return jobs.queue('waitForAppsRegistrationNoop', async () => { /* NOOP */ })
 }
 
-export async function sendApps (ctx: BackendContext) {
+export async function sendApps(ctx: BackendContext) {
   const appRecords = []
 
   for (const appRecord of ctx.appRecords) {
-    if (!(await appRecord.backend.api.getComponentDevtoolsOptions(appRecord.rootInstance)).hide) {
-      appRecords.push(appRecord)
-    }
+    appRecords.push(appRecord)
   }
 
   ctx.bridge.send(BridgeEvents.TO_FRONT_APP_LIST, {
@@ -188,34 +230,75 @@ export async function sendApps (ctx: BackendContext) {
   })
 }
 
-export async function removeApp (app: App, ctx: BackendContext) {
+function removeAppRecord(appRecord: AppRecord, ctx: BackendContext) {
   try {
-    const appRecord = await getAppRecord(app, ctx)
-    if (appRecord) {
-      appIds.delete(appRecord.id)
-      const index = ctx.appRecords.indexOf(appRecord)
-      if (index !== -1) ctx.appRecords.splice(index, 1)
-      removeLayersForApp(app, ctx)
-      ctx.bridge.send(BridgeEvents.TO_FRONT_APP_REMOVE, { id: appRecord.id })
+    appIds.delete(appRecord.id)
+    const index = ctx.appRecords.indexOf(appRecord)
+    if (index !== -1) {
+      ctx.appRecords.splice(index, 1)
     }
-  } catch (e) {
+    removeLayersForApp(appRecord.options.app, ctx)
+    ctx.bridge.send(BridgeEvents.TO_FRONT_APP_REMOVE, { id: appRecord.id })
+  }
+  catch (e) {
     if (SharedData.debugInfo) {
       console.error(e)
     }
   }
 }
 
-// eslint-disable-next-line camelcase
-export async function _legacy_getAndRegisterApps (Vue: any, ctx: BackendContext) {
-  const apps = scan()
-  apps.forEach(app => {
-    registerApp({
-      app,
-      types: {},
-      version: Vue.version,
-      meta: {
-        Vue,
-      },
-    }, ctx)
-  })
+export async function removeApp(app: App, ctx: BackendContext) {
+  try {
+    const appRecord = await getAppRecord(app, ctx)
+    if (appRecord) {
+      removeAppRecord(appRecord, ctx)
+    }
+  }
+  catch (e) {
+    if (SharedData.debugInfo) {
+      console.error(e)
+    }
+  }
+}
+
+let scanTimeout: any
+
+export function _legacy_getAndRegisterApps(ctx: BackendContext, clear = false) {
+  setTimeout(() => {
+    try {
+      if (clear) {
+        // Remove apps that are legacy
+        ctx.appRecords.forEach((appRecord) => {
+          if (appRecord.meta.Vue) {
+            removeAppRecord(appRecord, ctx)
+          }
+        })
+      }
+
+      const apps = scan()
+
+      clearTimeout(scanTimeout)
+      if (!apps.length) {
+        scanTimeout = setTimeout(() => _legacy_getAndRegisterApps(ctx), 1000)
+      }
+
+      apps.forEach((app) => {
+        const Vue = hook.Vue
+        registerApp({
+          app,
+          types: {},
+          version: Vue?.version,
+          meta: {
+            Vue,
+          },
+        }, ctx)
+      })
+    }
+    catch (e) {
+      if (SharedData.debugInfo) {
+        console.error(`Error scanning for legacy apps:`)
+        console.error(e)
+      }
+    }
+  }, 0)
 }

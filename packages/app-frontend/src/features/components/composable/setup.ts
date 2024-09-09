@@ -1,38 +1,29 @@
-import { Bridge, BridgeEvents, parse, getStorage } from '@vue-devtools/shared-utils'
+import type { Bridge } from '@vue-devtools/shared-utils'
+import { BridgeEvents, getStorage, parse } from '@vue-devtools/shared-utils'
 import { putError } from '@front/features/error'
 import {
-  selectedComponentPendingId,
-  expandedMap,
-  resetComponentsQueued,
-  resetComponents,
-  componentsMap,
-  restoreChildrenFromComponentsMap,
-  updateComponentsMapData,
-  addToComponentsMap,
-  rootInstances,
-  selectedComponentId,
-  selectedComponentData,
+  addUpdateTrackingEvent,
+  ensureComponentsMapData,
+  getAppIdFromComponentId,
+  isComponentOpen,
+  lastSelectedComponentId,
   loadComponent,
-  setComponentOpen,
   requestComponentTree,
   requestedComponentTree,
-  getAppIdFromComponentId,
-  lastSelectedComponentId,
+  rootInstances,
+  selectedComponentData,
+  selectedComponentId,
+  selectedComponentPendingId,
+  setComponentOpen,
 } from './components'
 
-export function setupComponentsBridgeEvents (bridge: Bridge) {
+export function setupComponentsBridgeEvents(bridge: Bridge) {
   selectedComponentPendingId.value = null
-  expandedMap.value = {}
 
   bridge.on(BridgeEvents.TO_FRONT_COMPONENT_TREE, ({ instanceId, treeData, notFound }) => {
     requestedComponentTree.delete(instanceId)
 
     const isRoot = instanceId.endsWith('root')
-
-    // Reset
-    if (resetComponentsQueued.value) {
-      resetComponents()
-    }
 
     // Not supported
     if (!treeData) {
@@ -44,21 +35,18 @@ export function setupComponentsBridgeEvents (bridge: Bridge) {
 
     // Handle tree data
     const data = parse(treeData)
-    const instance = componentsMap.value[instanceId]
-    if (instance) {
-      for (const item of data) {
-        restoreChildrenFromComponentsMap(item)
-        const component = updateComponentsMapData(item)
-        addToComponentsMap(component)
+    if (isRoot) {
+      rootInstances.value = data.map(i => ensureComponentsMapData(i))
+    }
+    else {
+      for (const child of data) {
+        ensureComponentsMapData(child)
       }
-    } else if (Array.isArray(data)) {
-      rootInstances.value = data
-      data.forEach(i => addToComponentsMap(i))
     }
 
     // Try to load selected component again
-    if (isRoot && selectedComponentId.value && !selectedComponentData.value && !selectedComponentPendingId.value &&
-      getAppIdFromComponentId(selectedComponentId.value) === getAppIdFromComponentId(instanceId)) {
+    if (isRoot && selectedComponentId.value && !selectedComponentData.value && !selectedComponentPendingId.value
+      && getAppIdFromComponentId(selectedComponentId.value) === getAppIdFromComponentId(instanceId)) {
       loadComponent(selectedComponentId.value)
     }
   })
@@ -71,17 +59,25 @@ export function setupComponentsBridgeEvents (bridge: Bridge) {
       selectedComponentPendingId.value = null
     }
     if (parentIds) {
-      parentIds.reverse().forEach(id => {
+      parentIds.reverse().forEach((id) => {
         // Ignore root
-        if (id.endsWith('root')) return
-        setComponentOpen(id, true)
-        requestComponentTree(id)
+        if (id.endsWith('root')) {
+          return
+        }
+        if (!isComponentOpen(id)) {
+          setComponentOpen(id, true)
+          requestComponentTree(id)
+        }
       })
     }
   })
 
   bridge.on(BridgeEvents.TO_FRONT_COMPONENT_INSPECT_DOM, () => {
     chrome.devtools.inspectedWindow.eval('inspect(window.__VUE_DEVTOOLS_INSPECT_TARGET__)')
+  })
+
+  bridge.on(BridgeEvents.TO_FRONT_COMPONENT_UPDATED, ({ instanceId, time }) => {
+    addUpdateTrackingEvent(instanceId, time)
   })
 
   // Persistance
